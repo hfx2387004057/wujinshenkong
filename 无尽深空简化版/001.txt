@@ -1,0 +1,1054 @@
+#include <Windows.h>
+#include <gdiplus.h>
+#include <stdio.h>
+#include <mmsystem.h>
+#include <vector>
+#include <cstdlib>  // 新增：rand() 函数所需
+#include <ctime>    // 新增：time() 函数所需
+#include <shlwapi.h> // 新增：PathFileExistsW（判断存档是否存在）
+#pragma comment(lib, "shlwapi.lib") // 新增：链接shlwapi库
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")
+using namespace Gdiplus;
+
+using namespace std;
+
+// 卡牌分类枚举
+enum CardCategory {
+    CATEGORY_ANIMAL,   // 动物类
+    CATEGORY_ITEM      // 物品类
+};
+
+// 动物类型枚举（动物类下的细分）
+enum AnimalType {
+    ANIMAL_HUMAN,      // 人类
+    // 后续可添加其他动物类型（如ANIMAL_WOLF等）
+};
+// 全局结构体：用于传递EnumWindows所需的多参数
+struct FindPlayerParam {
+    DWORD targetPid;    // 目标进程ID
+    HWND* foundHwnd;    // 找到的窗口句柄地址
+};
+// 卡牌结构体
+struct Card {
+    int x, y;           // 卡牌位置
+    int width, height;  // 卡牌大小（60*90）
+    WCHAR imgPath[MAX_PATH];
+    CardCategory category; // 分类（动物类）
+    AnimalType animalType; // 动物类下的细分（人类）
+    bool isDragging;    // 是否正在被拖拽
+    int dragOffsetX, dragOffsetY; // 鼠标相对于卡牌的偏移量
+};
+
+vector<Card> g_cards;  // 存储所有卡牌
+int g_draggingCardIndex = -1; // 当前拖拽的卡牌索引（-1表示无）
+// 剧情进度枚举（未触发/触发中/触发结束）
+enum StoryProgress {
+    STORY_NOT_TRIGGERED,  // 未触发
+    STORY_TRIGGERING,     // 触发中（如显示图片阶段）
+    STORY_TRIGGER_FINISHED// 触发结束（永久不重复）
+};
+// 游戏状态结构体（保存所有需持久化的进度）
+struct GameState {
+    int currentIndex;        // 当前界面索引（如3=游戏界面，1=初始界面）
+    size_t cardCount;        // 卡牌数量（序列化vector需先存数量）
+    vector<Card> cards;      // 所有卡牌（含位置、属性）
+    StoryProgress storyWorld1Progress; // 剧情1进度
+};
+
+// 全局游戏状态+控制变量
+GameState g_gameState = { 0, 0, {}, STORY_NOT_TRIGGERED }; // 初始进度：未触发
+HANDLE g_autoSaveThread = NULL; // 自动保存线程句柄
+bool g_shouldAutoSave = false;  // 自动保存开关（控制线程启停）
+bool g_isLoadedFromSave = false;// 是否从存档加载（跳过初始化新卡牌）
+bool g_skipLoadGameCheck = false; //跳过存档检测的标志
+// ==========定义MediaInfo函数指针类型 ==========
+typedef void* (__stdcall* MediaInfo_New_t)();
+typedef void(__stdcall* MediaInfo_Delete_t)(void* handle);
+typedef int(__stdcall* MediaInfo_Open_t)(void* handle, const wchar_t* filename);
+typedef const wchar_t* (__stdcall* MediaInfo_Get_t)(void* handle, size_t streamKind, size_t streamNumber, const wchar_t* parameter, int infoKind, int searchKind);
+
+// 全局函数指针（运行时加载DLL后赋值）
+MediaInfo_New_t pMediaInfo_New = NULL;
+MediaInfo_Delete_t pMediaInfo_Delete = NULL;
+MediaInfo_Open_t pMediaInfo_Open = NULL;
+MediaInfo_Get_t pMediaInfo_Get = NULL;
+
+// 枚举类型（保持原逻辑）
+enum MediaInfo_StreamKind { MediaInfo_StreamKind_General = 0 };
+enum MediaInfo_InfoKind { MediaInfo_InfoKind_Text = 1 };
+// 剧情类型枚举（后续可扩展更多剧情）
+enum StoryType {
+    STORY_WORLD_1,  // 剧情1：世界
+};
+
+// 函数声明（原逻辑保持）
+void GameStoryFramework(StoryType storyType, HDC memDC);
+void CreateVideoWindow(HWND hParentWnd);
+void EnterGameScreen();
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// 全局变量（原逻辑保持）
+HINSTANCE g_hInstance;
+HWND g_hBtnStart = NULL;
+HWND g_hBtnExit = NULL;
+HWND g_hMainWnd = NULL;
+
+#define IDC_BUTTON_START 1001
+#define IDC_BUTTON_EXIT  1002
+bool buttonsCreated = false;
+#define IDC_BUTTON_EXIT_GAME 1003  // 游戏内退出按钮ID
+#define IDC_BUTTON_RETRY     1004  // 游戏内重来按钮ID
+
+HWND g_hBtnExitGame = NULL;  // 退出按钮句柄
+HWND g_hBtnRetry = NULL;     // 重来按钮句柄
+
+// 图片路径数组（原逻辑保持）
+const WCHAR* imagePaths[] = {
+    L"\\游戏资源\\干子游戏.jpg",
+    L"\\游戏资源\\游戏背景.jpg"
+};
+int currentIndex = 0;
+const int imageCount = sizeof(imagePaths) / sizeof(imagePaths[0]);
+WCHAR g_currentBackgroundPath[MAX_PATH];
+int g_screenWidth = 0;
+int g_screenHeight = 0;
+ULONG_PTR gdiplusToken; // GDI+ 全局变量
+// ========== 全局常量与变量（新增弹出窗口相关） ==========
+// 弹出窗口相关
+#define POPUP_WND_CLASS L"PopupWindowClass"
+HWND g_hPopupWnd = NULL;                  // 弹出窗口句柄
+const WCHAR* g_popupImagePaths[2] = {     // 弹出窗口需加载的图片
+    L"\\游戏资源\\干子抖音.jpg",
+    L"\\游戏资源\\赞赏码.jpg"
+};
+const WCHAR* g_popupText = L"感谢您游玩我的游戏，本游戏完全免费，当然，您也可以给我的付出一点回报，以下是赞赏码和抖音号，请关注抖音，我会发布后续的更新和内容，当然，您也可以反馈。";
+
+// ========== 函数声明（新增弹出窗口相关函数） ==========
+LRESULT CALLBACK PopupWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+void CreatePopupWindow(HWND hParentWnd);
+
+// 播放启动音效（原逻辑保持）
+void PlayStartupSound() {
+    WCHAR soundPath[MAX_PATH];
+    WCHAR command[MAX_PATH * 2];
+
+    GetCurrentDirectory(MAX_PATH, soundPath);
+    wcscat_s(soundPath, L"\\游戏资源\\启动音效.mp3");
+
+    swprintf_s(command, L"open \"%s\" type mpegvideo alias startupSound", soundPath);
+    mciSendStringW(command, NULL, 0, NULL);
+    mciSendStringW(L"play startupSound", NULL, 0, NULL);
+}
+
+// ========== 弹出窗口创建函数（新增） ==========
+void CreatePopupWindow(HWND hParentWnd) {
+    if (g_hPopupWnd != NULL) return; // 避免重复创建
+
+    // 1. 注册弹出窗口类
+    WNDCLASS wc = { 0 };
+    wc.lpfnWndProc = PopupWndProc;
+    wc.hInstance = g_hInstance;
+    wc.lpszClassName = POPUP_WND_CLASS;
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH); // 白色背景
+    RegisterClass(&wc);
+
+    // 2. 计算弹出窗口位置（居中显示，大小适配图片和文字）
+    int popupWidth = 800;  // 窗口宽度
+    int popupHeight = 600; // 窗口高度
+    int x = (g_screenWidth - popupWidth) / 2;
+    int y = (g_screenHeight - popupHeight) / 2;
+
+    // 3. 创建弹出窗口（带标题栏和关闭按钮）
+    g_hPopupWnd = CreateWindowEx(
+        0,
+        POPUP_WND_CLASS,
+        L"游戏说明",                  // 窗口标题
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, // 置顶+可关闭
+        x, y, popupWidth, popupHeight,
+        hParentWnd,
+        NULL,
+        g_hInstance,
+        NULL
+    );
+
+    if (g_hPopupWnd != NULL) {
+        ShowWindow(g_hPopupWnd, SW_SHOW);
+        UpdateWindow(g_hPopupWnd);
+    }
+}
+
+// ========== 弹出窗口消息处理（新增：绘制图片和文字） ==========
+LRESULT CALLBACK PopupWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT wndRect;
+        GetClientRect(hWnd, &wndRect);
+        int wndWidth = wndRect.right - wndRect.left;
+        int wndHeight = wndRect.bottom - wndRect.top;
+
+        // 1. 绘制文字（顶部区域）
+        HFONT hFont = CreateFont(
+            28, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE,
+            L"微软雅黑"
+        );
+        SelectObject(hdc, hFont);
+        SetTextColor(hdc, RGB(0, 0, 0)); // 黑色文字
+        SetBkMode(hdc, TRANSPARENT);
+
+        // 文字显示区域（顶部20%高度）
+        RECT textRect = { 20, 20, wndWidth - 20, wndHeight * 0.2 };
+        DrawText(hdc, g_popupText, -1, &textRect, DT_WORDBREAK | DT_CENTER | DT_VCENTER);
+        DeleteObject(hFont); // 释放字体资源
+
+        // 2. 绘制两张图片（文字下方，左右排列）
+        int imgWidth = (wndWidth - 60) / 2;  // 图片宽度（留边距）
+        int imgHeight = wndHeight * 0.7;     // 图片高度
+        int imgX1 = 20;                      // 第一张图X坐标
+        int imgX2 = wndWidth - imgWidth - 20;// 第二张图X坐标
+        int imgY = wndHeight * 0.2 + 20;     // 图片Y坐标（文字下方）
+
+        for (int i = 0; i < 2; i++) {
+            WCHAR imgPath[MAX_PATH];
+            GetCurrentDirectory(MAX_PATH, imgPath);
+            wcscat_s(imgPath, g_popupImagePaths[i]);
+
+            // 加载图片
+            Image* pImg = Image::FromFile(imgPath);
+            if (pImg && pImg->GetLastStatus() == Ok) {
+                Graphics graphics(hdc);
+                // 按窗口区域缩放图片（保持比例）
+                graphics.DrawImage(pImg,
+                    i == 0 ? imgX1 : imgX2, imgY,
+                    imgWidth, imgHeight);
+                delete pImg;
+            }
+            else {
+                // 图片加载失败提示
+                WCHAR errMsg[256];
+                swprintf_s(errMsg, L"图片 %s 加载失败", g_popupImagePaths[i]);
+                MessageBox(hWnd, errMsg, L"错误", MB_OK);
+            }
+        }
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        g_hPopupWnd = NULL; // 重置窗口句柄
+        return 0;
+    case WM_DESTROY:
+        return 0;
+    default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+}
+
+// ========== 新增：保存游戏进度（含所有卡牌及位置） ==========
+void SaveGame() {
+    WCHAR savePath[MAX_PATH];
+    GetCurrentDirectory(MAX_PATH, savePath);
+    wcscat_s(savePath, L"\\游戏资源\\savegame.dat");
+
+    // 1. 更新当前游戏状态（确保保存最新数据）
+    g_gameState.currentIndex = currentIndex;
+    g_gameState.cardCount = g_cards.size();
+    g_gameState.cards = g_cards;
+
+    // 2. 处理视频播放中场景：关闭视频，标记为已进入游戏界面
+    if (currentIndex != 3) { // 不在游戏界面（大概率在播放视频）
+        DWORD currentProcessId = GetCurrentProcessId();
+        HWND hPlayerWnd = NULL;
+        // 遍历关闭播放器窗口
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            DWORD pid;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == (DWORD)lParam) {
+                WCHAR className[256] = { 0 };
+                GetClassNameW(hwnd, className, 256);
+                if (_wcsicmp(className, L"Windows.Media.Playback.MediaPlayerPage") == 0 ||
+                    _wcsicmp(className, L"WMPlayerApp") == 0) {
+                    *(HWND*)lParam = hwnd;
+                    return FALSE;
+                }
+            }
+            return TRUE;
+            }, (LPARAM)&hPlayerWnd);
+        if (hPlayerWnd) PostMessage(hPlayerWnd, WM_CLOSE, 0, 0);
+        KillTimer(g_hMainWnd, 2); // 停止视频定时器
+        g_gameState.currentIndex = 3; // 标记为已进入游戏界面
+        currentIndex = 3; // 同步当前界面
+    }
+
+    // 3. 写入文件（二进制序列化）
+    HANDLE hFile = CreateFileW(
+        savePath,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        MessageBox(g_hMainWnd, L"保存进度失败！", L"错误", MB_OK);
+        return;
+    }
+
+    // 先写：界面索引 + 卡牌数量 + 剧情进度 + 所有卡牌
+    DWORD bytesWritten;
+    WriteFile(hFile, &g_gameState.currentIndex, sizeof(int), &bytesWritten, NULL);
+    WriteFile(hFile, &g_gameState.cardCount, sizeof(size_t), &bytesWritten, NULL);
+    WriteFile(hFile, &g_gameState.storyWorld1Progress, sizeof(StoryProgress), &bytesWritten, NULL); // 保存进度
+    if (g_gameState.cardCount > 0) {
+        WriteFile(hFile, g_gameState.cards.data(),
+            g_gameState.cardCount * sizeof(Card), &bytesWritten, NULL);
+    }
+    CloseHandle(hFile);
+}
+
+// ========== 新增：加载游戏进度（恢复所有卡牌及位置） ==========
+bool LoadGame() {
+    WCHAR savePath[MAX_PATH];
+    GetCurrentDirectory(MAX_PATH, savePath);
+    wcscat_s(savePath, L"\\游戏资源\\savegame.dat");
+
+    // 检查存档是否存在
+    if (!PathFileExistsW(savePath)) return false;
+
+    HANDLE hFile = CreateFileW(
+        savePath,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    DWORD bytesRead;
+    // 1. 读取界面索引（原有逻辑）
+    if (!ReadFile(hFile, &g_gameState.currentIndex, sizeof(int), &bytesRead, NULL) || bytesRead != sizeof(int)) {
+        CloseHandle(hFile);
+        return false;
+    }
+    // 2. 读取卡牌数量（原有逻辑）
+    if (!ReadFile(hFile, &g_gameState.cardCount, sizeof(size_t), &bytesRead, NULL) || bytesRead != sizeof(size_t)) {
+        CloseHandle(hFile);
+        return false;
+    }
+    // 3. 读取剧情进度（原有逻辑）
+    if (!ReadFile(hFile, &g_gameState.storyWorld1Progress, sizeof(StoryProgress), &bytesRead, NULL) || bytesRead != sizeof(StoryProgress)) {
+        CloseHandle(hFile);
+        return false;
+    }
+    // 4. 读取卡牌数据（核心修复：校验读取结果+正确初始化）
+    g_gameState.cards.clear(); // 清空原有数据，避免残留
+    if (g_gameState.cardCount > 0) {
+        g_gameState.cards.resize(g_gameState.cardCount); // 分配内存
+        // 读取所有卡牌，校验是否读取成功
+        if (!ReadFile(hFile, g_gameState.cards.data(), g_gameState.cardCount * sizeof(Card), &bytesRead, NULL) ||
+            bytesRead != g_gameState.cardCount * sizeof(Card)) {
+            g_gameState.cards.clear(); // 读取失败则清空
+            CloseHandle(hFile);
+            return false;
+        }
+    }
+
+    CloseHandle(hFile);
+    g_isLoadedFromSave = true;
+    return true;
+}
+
+// ========== 新增：自动保存线程（每2秒保存一次） ==========
+DWORD WINAPI AutoSaveThread(LPVOID lpParam) {
+    while (g_shouldAutoSave) {
+        Sleep(2000); // 每2秒触发一次保存
+        if (g_shouldAutoSave) { // 二次判断，避免线程退出时的竞争
+            SaveGame();
+        }
+    }
+    return 0;
+}
+
+// ========== 替换：读取视频时长（基于MediaInfo函数指针） ==========
+int GetVideoDuration(const WCHAR* videoPath) {
+    if (!pMediaInfo_New || !pMediaInfo_Delete || !pMediaInfo_Open || !pMediaInfo_Get) {
+        return -1; // 函数指针未初始化，加载失败
+    }
+
+    void* mi = pMediaInfo_New();  // 创建MediaInfo实例
+    if (!mi) return -1;
+
+    if (pMediaInfo_Open(mi, videoPath) == 0) {  // 打开视频文件
+        pMediaInfo_Delete(mi);
+        return -1;
+    }
+
+    // 读取时长（参数：通用流、第0个流、时长属性、文本格式）
+    const wchar_t* durationStr = pMediaInfo_Get(mi, MediaInfo_StreamKind_General, 0, L"Duration", MediaInfo_InfoKind_Text, 0);
+    int durationMs = durationStr ? _wtoi(durationStr) : -1;  // 转换为毫秒
+
+    pMediaInfo_Delete(mi);  // 释放资源
+    return durationMs;
+}
+
+// 全局回调函数：查找视频播放器窗口（修复参数传递）
+BOOL CALLBACK FindPlayerWindow(HWND hwnd, LPARAM lParam) {
+    FindPlayerParam* param = (FindPlayerParam*)lParam;
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+    // 匹配目标进程ID，且是指定播放器窗口类
+    if (pid == param->targetPid) {
+        WCHAR className[256] = { 0 };
+        GetClassNameW(hwnd, className, 256);
+        if (_wcsicmp(className, L"Windows.Media.Playback.MediaPlayerPage") == 0 ||
+            _wcsicmp(className, L"WMPlayerApp") == 0) {
+            *param->foundHwnd = hwnd; // 正确赋值窗口句柄
+            return FALSE; // 找到后停止遍历
+        }
+    }
+    return TRUE;
+}
+
+// 调用系统自带播放器全屏播放视频（按视频时长定时关闭）
+void CreateVideoWindow(HWND hParentWnd) {
+    // ========== 原有存档检测逻辑不变 ==========
+    if (!g_skipLoadGameCheck) {
+        if (LoadGame()) {
+            int result = MessageBox(hParentWnd,
+                L"检测到保存的游戏进度，是否继续游戏？",
+                L"继续游戏",
+                MB_YESNO | MB_ICONQUESTION);
+            if (result == IDYES) {
+                currentIndex = g_gameState.currentIndex;
+                ShowWindow(g_hMainWnd, SW_SHOWMAXIMIZED);
+                EnterGameScreen();
+                return;
+            }
+            else {
+                g_isLoadedFromSave = false;
+            }
+        }
+    }
+    else {
+        g_skipLoadGameCheck = false;
+    }
+
+    WCHAR videoPath[MAX_PATH] = { 0 };
+    GetCurrentDirectory(MAX_PATH, videoPath);
+    wcscat_s(videoPath, L"\\游戏资源\\昔涟开始动画1启行.mp4");
+    int videoDurationMs = GetVideoDuration(videoPath);
+
+    if (videoDurationMs <= 0) {
+        MessageBox(hParentWnd, L"视频时长读取失败，将直接进入游戏", L"提示", MB_OK);
+        EnterGameScreen();
+        return;
+    }
+
+    // ========== 启动视频播放器 ==========
+    SHELLEXECUTEINFOW sei = { 0 };
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpFile = videoPath;
+    sei.lpParameters = L"/fullscreen";
+    sei.nShow = SW_SHOWMAXIMIZED;
+    ShellExecuteExW(&sei);
+
+    // ========== 设置定时器，视频结束后处理（核心修复） ==========
+    SetTimer(hParentWnd, 2, videoDurationMs + 500, [](HWND hWnd, UINT msg, UINT_PTR idEvent, DWORD dwTime) {
+        KillTimer(hWnd, 2);
+        HWND hPlayerWnd = NULL;
+        DWORD currentPid = GetCurrentProcessId();
+        FindPlayerParam param = { currentPid, &hPlayerWnd }; // 初始化参数结构体
+
+        // 正确查找播放器窗口
+        EnumWindows(FindPlayerWindow, (LPARAM)&param);
+        if (hPlayerWnd != NULL) {
+            PostMessage(hPlayerWnd, WM_CLOSE, 0, 0); // 关闭播放器
+            Sleep(500); // 等待播放器关闭，避免遮挡主窗口
+        }
+
+        // ========== 强制激活主窗口并进入游戏界面 ==========
+        ShowWindow(g_hMainWnd, SW_RESTORE); // 恢复窗口（避免最小化）
+        SetForegroundWindow(g_hMainWnd);    // 置顶主窗口
+        SetFocus(g_hMainWnd);              // 设置焦点
+        InvalidateRect(g_hMainWnd, NULL, TRUE); // 强制重绘
+        UpdateWindow(g_hMainWnd);           // 立即更新界面
+        EnterGameScreen(); // 进入位面1森林界面
+    });
+}
+
+// 进入游戏界面
+void EnterGameScreen() {
+    WCHAR gameBgPath[MAX_PATH];
+    GetCurrentDirectory(MAX_PATH, gameBgPath);
+    wcscat_s(gameBgPath, L"\\游戏资源\\位面1森林.jpg");
+    wcscpy_s(g_currentBackgroundPath, gameBgPath);
+
+    currentIndex = 3;
+    //校验屏幕尺寸，若为0则重新获取（兜底修复）
+    if (g_screenWidth == 0 || g_screenHeight == 0) {
+        g_screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        g_screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    }
+    InvalidateRect(g_hMainWnd, NULL, TRUE);
+
+    ShowWindow(g_hMainWnd, SW_SHOWMAXIMIZED);
+    SetWindowPos(g_hMainWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    // ========== 新增：清空原有卡牌资源 ==========
+    g_cards.clear();
+    g_draggingCardIndex = -1;
+
+    // ========== 修改：从存档加载卡牌 / 初始化新卡牌 ==========
+    if (g_isLoadedFromSave) {
+        // 从存档加载：根据保存的路径重新加载图片
+        for (auto& savedCard : g_gameState.cards) {
+            Card newCard = savedCard;
+            // 根据保存的路径加载图片
+            Image* cardImg = Image::FromFile(newCard.imgPath);
+            if (cardImg && cardImg->GetLastStatus() == Ok) {
+                // 重置拖拽状态（加载后默认不拖拽）
+                newCard.isDragging = false;
+                newCard.dragOffsetX = 0;
+                newCard.dragOffsetY = 0;
+                g_cards.push_back(newCard);
+            }
+            else {
+                MessageBox(g_hMainWnd, L"加载卡牌图片失败！", L"错误", MB_OK);
+                delete cardImg;
+            }
+        }
+        g_isLoadedFromSave = false; // 重置标志，避免重复加载
+    }
+    else {
+        // 初始化新卡牌：随机位置，保存路径到Card结构体
+        WCHAR cardImgPath[MAX_PATH];
+        GetCurrentDirectory(MAX_PATH, cardImgPath);
+        wcscat_s(cardImgPath, L"\\游戏资源\\村民.jpg");
+
+        // 第一个村民卡牌（随机位置+保存路径）
+        Card card1;
+        card1.width = 60;
+        card1.height = 90;
+        card1.x = rand() % (g_screenWidth - card1.width);
+        card1.y = rand() % (g_screenHeight - card1.height);
+        wcscpy_s(card1.imgPath, cardImgPath); // 保存图片路径
+        card1.category = CATEGORY_ANIMAL;
+        card1.animalType = ANIMAL_HUMAN;
+        card1.isDragging = false;
+        card1.dragOffsetX = 0;
+        card1.dragOffsetY = 0;
+        g_cards.push_back(card1);
+
+        // 第二个村民卡牌（随机位置+保存路径）
+        Card card2;
+        card2.width = 60;
+        card2.height = 90;
+        card2.x = rand() % (g_screenWidth - card2.width);
+        card2.y = rand() % (g_screenHeight - card2.height);
+        wcscpy_s(card2.imgPath, cardImgPath); // 保存图片路径
+        card2.category = CATEGORY_ANIMAL;
+        card2.animalType = ANIMAL_HUMAN;
+        card2.isDragging = false;
+        card2.dragOffsetX = 0;
+        card2.dragOffsetY = 0;
+        g_cards.push_back(card2);
+    }
+}
+
+// 剧情函数框架声明
+void GameStoryFramework(StoryType storyType, HDC memDC) {
+    switch (storyType) {
+    case STORY_WORLD_1: {
+        // 触发规则：仅未触发时可启动剧情；触发中/结束时跳过
+        if (currentIndex != 3 || g_cards.empty() || g_gameState.storyWorld1Progress != STORY_NOT_TRIGGERED) {
+            // 触发中：继续绘制图片（保持剧情状态）
+            if (g_gameState.storyWorld1Progress == STORY_TRIGGERING) {
+                int picX = 50;
+                int picWidth = 220;
+                int picHeight = 330;
+                int picY = g_screenHeight - picHeight - 20;
+                const WCHAR* picPath = L"\\游戏资源\\司马老跌抠图版.png";
+
+                WCHAR fullPicPath[MAX_PATH];
+                GetCurrentDirectory(MAX_PATH, fullPicPath);
+                wcscat_s(fullPicPath, picPath);
+                Image* storyImg = Image::FromFile(fullPicPath);
+                if (storyImg && storyImg->GetLastStatus() == Ok) {
+                    Graphics graphics(memDC);
+                    graphics.DrawImage(storyImg, picX, picY, picWidth, picHeight);
+                }
+                delete storyImg;
+            }
+            break;
+        }
+
+        // 未触发 → 启动剧情（标记为触发中）
+        int picX = 50;
+        int picWidth = 220;
+        int picHeight = 330;
+        int picY = g_screenHeight - picHeight - 20;
+        const WCHAR* picPath = L"\\游戏资源\\司马老跌抠图版.png";
+
+        WCHAR fullPicPath[MAX_PATH];
+        GetCurrentDirectory(MAX_PATH, fullPicPath);
+        wcscat_s(fullPicPath, picPath);
+        Image* storyImg = Image::FromFile(fullPicPath);
+        if (storyImg && storyImg->GetLastStatus() == Ok) {
+            Graphics graphics(memDC);
+            graphics.DrawImage(storyImg, picX, picY, picWidth, picHeight);
+            // 关键：标记为「触发中」（未结束，存档后下次仍显示）
+            g_gameState.storyWorld1Progress = STORY_TRIGGERING;
+        }
+        else if (!storyImg) {
+            WCHAR errMsg[256];
+            swprintf_s(errMsg, L"剧情图片加载失败：%s", fullPicPath);
+            MessageBox(g_hMainWnd, errMsg, L"提示", MB_OK);
+        }
+        delete storyImg;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// 主窗口消息处理
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        g_hMainWnd = hWnd;
+        // 开启双缓冲：避免重绘时的闪烁
+        SetWindowLongPtr(hWnd, GWL_EXSTYLE, GetWindowLongPtr(hWnd, GWL_EXSTYLE) | WS_EX_COMPOSITED);
+        break;
+        // 1. 主窗口消息处理中添加WM_ERASEBKGND消息（阻止背景擦除）
+    case WM_ERASEBKGND:
+        return TRUE; // 直接返回TRUE，禁用默认背景擦除
+
+
+        // ========== 新增：鼠标按下（开始拖拽） ==========
+    case WM_LBUTTONDOWN: {
+        int mouseX = LOWORD(lParam);
+        int mouseY = HIWORD(lParam);
+        g_draggingCardIndex = -1;
+
+        for (int i = 0; i < g_cards.size(); i++) {
+            Card& card = g_cards[i];
+            if (mouseX >= card.x && mouseX <= card.x + card.width &&
+                mouseY >= card.y && mouseY <= card.y + card.height) {
+                card.isDragging = true;
+                card.dragOffsetX = mouseX - card.x;
+                card.dragOffsetY = mouseY - card.y;
+                g_draggingCardIndex = i;
+                break;
+            }
+        }
+        return 0;
+    }
+
+                       // ========== 新增：鼠标移动（拖拽中更新位置） ==========
+    case WM_MOUSEMOVE: {
+        if (g_draggingCardIndex != -1) {
+            int mouseX = LOWORD(lParam);
+            int mouseY = HIWORD(lParam);
+            Card& card = g_cards[g_draggingCardIndex];
+            // 1. 记录卡牌移动前的区域（用于擦除旧位置）
+            RECT oldRect = { card.x, card.y, card.x + card.width, card.y + card.height };
+
+            // 2. 更新卡牌新位置
+            card.x = mouseX - card.dragOffsetX;
+            card.y = mouseY - card.dragOffsetY;
+
+            // 3. 记录卡牌移动后的区域（用于绘制新位置）
+            RECT newRect = { card.x, card.y, card.x + card.width, card.y + card.height };
+
+            // 4. 合并新旧区域，只重绘这个小范围（关键优化）
+            RECT updateRect;
+            UnionRect(&updateRect, &oldRect, &newRect);
+            InvalidateRect(hWnd, &updateRect, TRUE); // 仅重绘卡牌移动的区域
+        }
+        return 0;
+    }
+
+                     // ========== 新增：鼠标释放（结束拖拽） ==========
+    case WM_LBUTTONUP: {
+        if (g_draggingCardIndex != -1) {
+            g_cards[g_draggingCardIndex].isDragging = false;
+            g_draggingCardIndex = -1;
+        }
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        // 全局双缓冲：创建内存DC和位图
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, g_screenWidth, g_screenHeight);
+        SelectObject(memDC, memBmp);
+        // 1. 绘制背景到内存DC
+        Image* pImage = NULL;
+        // （原有背景绘制逻辑不变，只是把 hdc 换成 memDC）
+        if (currentIndex < imageCount) {
+            WCHAR imgPath[MAX_PATH];
+            GetCurrentDirectory(MAX_PATH, imgPath);
+            wcscat_s(imgPath, imagePaths[currentIndex]);
+            pImage = Image::FromFile(imgPath);
+        }
+        else {
+            pImage = Image::FromFile(g_currentBackgroundPath);
+        }
+        if (pImage && pImage->GetLastStatus() == Ok) {
+            Graphics graphics(memDC); // 这里改 memDC
+            graphics.DrawImage(pImage, 0, 0, g_screenWidth, g_screenHeight);
+            delete pImage;
+        }
+        // 2. 绘制卡牌到内存DC（无需局部双缓冲）
+        if (currentIndex == 3) {
+            for (auto& card : g_cards) {
+                Image* cardImg = Image::FromFile(card.imgPath);
+                if (cardImg && cardImg->GetLastStatus() == Ok) {
+                    Graphics graphics(memDC); // 这里改 memDC
+                    graphics.DrawImage(cardImg, card.x, card.y, card.width, card.height);
+                }
+                delete cardImg;
+            }
+            // 新增：调用剧情函数，绘制剧情1图片（直接传递memDC）
+            GameStoryFramework(STORY_WORLD_1, memDC);
+        }
+        // 3. 一次性复制内存DC到屏幕DC（无闪烁）
+        BitBlt(hdc, 0, 0, g_screenWidth, g_screenHeight, memDC, 0, 0, SRCCOPY);
+        // 释放资源
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+        EndPaint(hWnd, &ps);
+        // 2. 控制不同界面的按钮显示/隐藏（核心修改部分）
+        if (currentIndex == 1) {
+            // 初始界面：显示「开始游戏」「退出游戏」按钮（原有按钮）
+            ShowWindow(g_hBtnStart, SW_SHOW);
+            ShowWindow(g_hBtnExit, SW_SHOW);
+            // 隐藏游戏界面的按钮（防止叠加）
+            if (g_hBtnExitGame) ShowWindow(g_hBtnExitGame, SW_HIDE);
+            if (g_hBtnRetry) ShowWindow(g_hBtnRetry, SW_HIDE);
+        }
+        else if (currentIndex == 3) {
+            // 游戏界面：显示右上角「退出」「重来」按钮（默认样式）
+            // 隐藏初始界面按钮（防止叠加）
+            ShowWindow(g_hBtnStart, SW_HIDE);
+            ShowWindow(g_hBtnExit, SW_HIDE);
+
+            // 创建「退出」按钮（仅首次创建，避免重复生成）
+            if (!g_hBtnExitGame) {
+                g_hBtnExitGame = CreateWindowEx(
+                    0,                  // 无扩展样式
+                    L"BUTTON",          // 按钮类名（系统默认）
+                    L"退出",            // 按钮文字
+                    WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, // 默认按钮样式（无自定义背景）
+                    g_screenWidth - 120, 20, 100, 40,     // 位置：右上角（右距120，上距20），大小100*40
+                    hWnd,               // 父窗口（主窗口）
+                    (HMENU)IDC_BUTTON_EXIT_GAME, // 按钮ID（自定义）
+                    g_hInstance,        // 应用实例句柄
+                    NULL                // 无额外参数
+                );
+            }
+            // 创建「重来」按钮（仅首次创建）
+            if (!g_hBtnRetry) {
+                g_hBtnRetry = CreateWindowEx(
+                    0,
+                    L"BUTTON",
+                    L"重来",
+                    WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, // 默认按钮样式
+                    g_screenWidth - 240, 20, 100, 40,     // 位置：「退出」按钮左侧（右距240）
+                    hWnd,
+                    (HMENU)IDC_BUTTON_RETRY, // 按钮ID（自定义）
+                    g_hInstance,
+                    NULL
+                );
+            }
+            // 确保按钮显示
+            ShowWindow(g_hBtnExitGame, SW_SHOW);
+            ShowWindow(g_hBtnRetry, SW_SHOW);
+        }
+        else {
+            // 其他界面（如视频播放中）：隐藏所有按钮
+            ShowWindow(g_hBtnStart, SW_HIDE);
+            ShowWindow(g_hBtnExit, SW_HIDE);
+            if (g_hBtnExitGame) ShowWindow(g_hBtnExitGame, SW_HIDE);
+            if (g_hBtnRetry) ShowWindow(g_hBtnRetry, SW_HIDE);
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam == 1) {
+            currentIndex = 1;
+            InvalidateRect(hWnd, NULL, TRUE);
+
+            g_hBtnStart = CreateWindowEx(
+                0, L"BUTTON", L"开始游戏",
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                700, 650, 150, 50,
+                hWnd, (HMENU)IDC_BUTTON_START, g_hInstance, NULL
+            );
+
+            g_hBtnExit = CreateWindowEx(
+                0, L"BUTTON", L"退出游戏",
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                900, 650, 150, 50,
+                hWnd, (HMENU)IDC_BUTTON_EXIT, g_hInstance, NULL
+            );
+
+            buttonsCreated = true;
+            KillTimer(hWnd, 1);
+            // ========== 新增：触发弹出窗口（3秒后进入初始界面时弹出） ==========
+            CreatePopupWindow(hWnd);
+        }
+        // ========== 替换：WM_TIMER 中关闭播放器的逻辑 ==========
+        else if (wParam == 2) {
+            KillTimer(hWnd, 2);
+
+            // 1. 获取当前进程ID（确保只关闭当前程序启动的播放器）
+            DWORD currentProcessId = GetCurrentProcessId();
+
+            // 2. 遍历所有窗口，查找属于当前进程的媒体播放器
+            HWND hPlayerWnd = NULL;
+            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                DWORD pid;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid == (DWORD)lParam) {
+                    WCHAR className[256] = { 0 };
+                    GetClassNameW(hwnd, className, 256);
+                    if (_wcsicmp(className, L"Windows.Media.Playback.MediaPlayerPage") == 0 ||
+                        _wcsicmp(className, L"WMPlayerApp") == 0) {
+                        *(HWND*)lParam = hwnd;
+                        return FALSE; // 找到后停止遍历
+                    }
+                }
+                return TRUE;
+                }, (LPARAM)&hPlayerWnd);
+
+            // 3. 关闭找到的播放器窗口
+            if (hPlayerWnd != NULL) {
+                PostMessage(hPlayerWnd, WM_CLOSE, 0, 0);
+            }
+
+            ShowWindow(g_hMainWnd, SW_SHOWMAXIMIZED);
+            EnterGameScreen();
+        }
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_BUTTON_EXIT:
+            PostMessage(hWnd, WM_CLOSE, 0, 0);
+            break;
+        case IDC_BUTTON_START:
+            ShowWindow(g_hBtnStart, SW_HIDE);
+            ShowWindow(g_hBtnExit, SW_HIDE);
+            // ========== 新增：启动自动保存线程（每2秒保存） ==========
+            g_shouldAutoSave = true;
+            if (g_autoSaveThread == NULL) {
+                g_autoSaveThread = CreateThread(
+                    NULL, 0, AutoSaveThread, NULL, 0, NULL
+                );
+            }
+            // 2. 隐藏主窗口（核心：避免视频播放时看到其他界面）
+            ShowWindow(g_hMainWnd, SW_HIDE);
+            CreateVideoWindow(hWnd);
+            break;
+            // ==========游戏内“退出”按钮逻辑 ==========
+        case IDC_BUTTON_EXIT_GAME: {
+            int result = MessageBox(hWnd, L"是否确认退出游戏？", L"退出确认", MB_YESNO | MB_ICONQUESTION);
+            if (result == IDYES) {
+                // ==========点击退出按钮时保存游戏进度 ==========
+                SaveGame();
+                // ==========停止自动保存线程 ==========
+                g_shouldAutoSave = false;
+                if (g_autoSaveThread != NULL) {
+                    WaitForSingleObject(g_autoSaveThread, INFINITE);
+                    CloseHandle(g_autoSaveThread);
+                    g_autoSaveThread = NULL;
+                }
+
+                currentIndex = 1;  // 跳回初始界面
+                InvalidateRect(hWnd, NULL, TRUE);
+                g_cards.clear();
+                g_draggingCardIndex = -1;
+            }
+
+        }
+                                 break;
+                                 // ========== 新增：游戏内“重来”按钮逻辑 ==========
+        case IDC_BUTTON_RETRY: {
+            int result = MessageBox(hWnd, L"是否确认重新开始？", L"重新开始确认", MB_YESNO | MB_ICONQUESTION);
+            if (result == IDYES) {
+                // 重置剧情1进度为「未触发」（重新开始可再次启动剧情）
+                g_gameState.storyWorld1Progress = STORY_NOT_TRIGGERED;
+                // ==========设置跳过检测标志 ==========
+                g_skipLoadGameCheck = true;
+                // 1. 隐藏主窗口（避免视频播放时看到游戏界面）
+                ShowWindow(g_hMainWnd, SW_HIDE);
+                CreateVideoWindow(hWnd);  // 重新播放视频，从开头开始
+            }
+        }
+                             break;
+        }
+        break;
+        // ========== 替换：WM_KEYDOWN 中关闭播放器的逻辑 ==========
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DWORD currentProcessId = GetCurrentProcessId();
+            HWND hPlayerWnd = NULL;
+            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                DWORD pid;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid == (DWORD)lParam) {
+                    WCHAR className[256] = { 0 };
+                    GetClassNameW(hwnd, className, 256);
+                    if (_wcsicmp(className, L"Windows.Media.Playback.MediaPlayerPage") == 0 ||
+                        _wcsicmp(className, L"WMPlayerApp") == 0) {
+                        *(HWND*)lParam = hwnd;
+                        return FALSE;
+                    }
+                }
+                return TRUE;
+                }, (LPARAM)&hPlayerWnd);
+
+            if (hPlayerWnd) {
+                PostMessage(hPlayerWnd, WM_CLOSE, 0, 0);
+            }
+            KillTimer(g_hMainWnd, 2);
+            ShowWindow(g_hMainWnd, SW_SHOWMAXIMIZED);
+            EnterGameScreen();
+        }
+        break;
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
+        HDC hdc = dis->hDC;
+        RECT btnRect = dis->rcItem;
+
+        if (dis->CtlID == IDC_BUTTON_START) {
+            FillRect(hdc, &btnRect, CreateSolidBrush(RGB(0, 255, 0)));
+            SetTextColor(hdc, RGB(255, 255, 255));
+            SetBkMode(hdc, TRANSPARENT);
+            DrawText(hdc, L"开始游戏", -1, &btnRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        else if (dis->CtlID == IDC_BUTTON_EXIT) {
+            FillRect(hdc, &btnRect, CreateSolidBrush(RGB(255, 0, 0)));
+            SetTextColor(hdc, RGB(255, 255, 255));
+            SetBkMode(hdc, TRANSPARENT);
+            DrawText(hdc, L"退出游戏", -1, &btnRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        return 0;
+    }
+
+    case WM_DESTROY:
+        // ========== 新增：停止自动保存线程 ==========
+        g_shouldAutoSave = false;
+        if (g_autoSaveThread != NULL) {
+            WaitForSingleObject(g_autoSaveThread, INFINITE);
+            CloseHandle(g_autoSaveThread);
+        }
+
+        // 原有资源释放（不变）
+        if (g_hPopupWnd != NULL) {
+            DestroyWindow(g_hPopupWnd);
+        }
+        g_cards.clear();
+        PostQuitMessage(0);
+        return 0;
+
+    default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // ==========动态加载MediaInfo.dll ==========
+    WCHAR dllPath[MAX_PATH];
+    GetCurrentDirectory(MAX_PATH, dllPath);  // 获取程序当前目录
+    wcscat_s(dllPath, L"\\游戏资源\\MediaInfo.dll");  // 拼接DLL路径
+
+    HMODULE hMediaInfoDll = LoadLibraryW(dllPath);
+    if (!hMediaInfoDll) {
+        MessageBox(NULL, L"无法加载MediaInfo.dll，请确认文件在游戏资源文件夹中", L"错误", MB_OK);
+        return 1;
+    }
+
+    // 获取DLL中导出函数的地址
+    pMediaInfo_New = (MediaInfo_New_t)GetProcAddress(hMediaInfoDll, "MediaInfo_New");
+    pMediaInfo_Delete = (MediaInfo_Delete_t)GetProcAddress(hMediaInfoDll, "MediaInfo_Delete");
+    pMediaInfo_Open = (MediaInfo_Open_t)GetProcAddress(hMediaInfoDll, "MediaInfo_Open");
+    pMediaInfo_Get = (MediaInfo_Get_t)GetProcAddress(hMediaInfoDll, "MediaInfo_Get");
+
+    if (!pMediaInfo_New || !pMediaInfo_Delete || !pMediaInfo_Open || !pMediaInfo_Get) {
+        MessageBox(NULL, L"MediaInfo.dll版本不兼容，请使用官网32位DLL", L"错误", MB_OK);
+        FreeLibrary(hMediaInfoDll);
+        return 1;
+    }
+
+    // 原有WinMain逻辑（保持不变）
+    g_hInstance = hInstance;
+
+    // GDI+初始化
+    GdiplusStartupInput gdiplusStartupInput;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    // ========== 新增：初始化随机种子（每次启动随机位置不同） ==========
+    srand((unsigned int)time(NULL));
+    PlayStartupSound();
+
+    WNDCLASS wc = { 0 };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"FullScreenWindowClass";
+    RegisterClass(&wc);
+
+    HWND hWnd = CreateWindow(
+        L"FullScreenWindowClass", L"游戏全屏界面",
+        WS_POPUP | WS_VISIBLE,
+        0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+
+    // 获取屏幕尺寸
+    g_screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    g_screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    // 设置窗口为全屏
+    SetWindowPos(hWnd, NULL, 0, 0, g_screenWidth, g_screenHeight, SWP_NOZORDER);
+    // 提前获取屏幕尺寸（关键修复）
+    g_screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    g_screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    SetTimer(hWnd, 1, 3000, NULL);
+
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    // ========== 新增：释放MediaInfo.dll ==========
+    if (hMediaInfoDll) {
+        FreeLibrary(hMediaInfoDll);
+    }
+
+    // GDI+关闭
+    GdiplusShutdown(gdiplusToken);
+
+    return (int)msg.wParam;
+}
